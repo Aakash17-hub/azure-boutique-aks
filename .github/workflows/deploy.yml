@@ -1,0 +1,112 @@
+name: build-and-deploy
+
+# Builds frontend and cartservice, pushes them to Azure Container Registry,
+# and rolls them out to AKS with automatic rollback on a failed rollout.
+# Azure login uses OIDC (federated credential on a user-assigned managed
+# identity), so no Azure password or secret key is stored in GitHub.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'cartservice/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Which service to build and deploy'
+        type: choice
+        options: [both, frontend, cartservice]
+        default: both
+      image_tag:
+        description: 'Optional: deploy this existing tag instead of building (leave empty for normal runs)'
+        type: string
+        default: ''
+
+permissions:
+  id-token: write   # needed to request the OIDC token for azure/login
+  contents: read
+
+concurrency:
+  group: deploy-aks
+  cancel-in-progress: false
+
+env:
+  ACR_NAME: acrboutiqueaakash
+  REGISTRY: acrboutiqueaakash.azurecr.io
+  RESOURCE_GROUP: rg-boutique
+  CLUSTER: aks-boutique
+  NAMESPACE: boutique
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Decide services and image tag
+        id: vars
+        env:
+          SERVICE_INPUT: ${{ inputs.service }}
+          TAG_INPUT: ${{ inputs.image_tag }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          SERVICE="${SERVICE_INPUT:-both}"
+          if [ "$SERVICE" = "both" ]; then
+            SERVICES="frontend cartservice"
+          else
+            SERVICES="$SERVICE"
+          fi
+          if [ -n "$TAG_INPUT" ]; then
+            TAG="$TAG_INPUT"; BUILD=false
+          else
+            TAG="$RUN_NUMBER"; BUILD=true
+          fi
+          echo "services=$SERVICES" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "Services: $SERVICES | tag: $TAG | build: $BUILD"
+
+      - name: Build and push to ACR
+        if: steps.vars.outputs.build == 'true'
+        env:
+          SERVICES: ${{ steps.vars.outputs.services }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          az acr login --name "$ACR_NAME"
+          for svc in $SERVICES; do
+            ctx="$svc"
+            [ "$svc" = "cartservice" ] && ctx="cartservice/src"
+            docker build -t "$REGISTRY/boutique/$svc:$TAG" "$ctx"
+            docker push "$REGISTRY/boutique/$svc:$TAG"
+          done
+
+      - name: Get AKS credentials
+        run: az aks get-credentials -g "$RESOURCE_GROUP" -n "$CLUSTER" --overwrite-existing
+
+      - name: Deploy with auto-rollback
+        env:
+          SERVICES: ${{ steps.vars.outputs.services }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          for svc in $SERVICES; do
+            image="$REGISTRY/boutique/$svc:$TAG"
+            echo "Deploying $image"
+            kubectl -n "$NAMESPACE" set image "deployment/$svc" "server=$image"
+            if ! kubectl -n "$NAMESPACE" rollout status "deployment/$svc" --timeout=180s; then
+              echo "Rollout of $svc ($TAG) failed - rolling back to the previous revision"
+              kubectl -n "$NAMESPACE" rollout undo "deployment/$svc"
+              kubectl -n "$NAMESPACE" rollout status "deployment/$svc" --timeout=180s
+              exit 1
+            fi
+          done
+          kubectl -n "$NAMESPACE" get deployments frontend cartservice
